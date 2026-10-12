@@ -6,7 +6,6 @@ use App\Enums\InvoiceStatus;
 use App\Enums\PaymentSource;
 use App\Http\Requests\Invoice\AddInvoiceLine;
 use App\Models\Invoice;
-use App\Models\InvoiceLine;
 use App\Models\Product;
 use App\Models\Setting;
 use App\Repositories\Currency\Currency;
@@ -16,13 +15,15 @@ use App\Services\Billing\BillingIntegrationRegistry;
 use App\Services\Billing\NullBillingAdapter;
 use App\Services\Invoice\InvoiceCalculator;
 use App\Services\Invoice\InvoiceService;
+use App\Services\InvoiceLine\InvoiceLineService;
 use App\Services\InvoiceNumber\InvoiceNumberService;
 use Carbon\Carbon;
 use Exception;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
-use Illuminate\Support\Facades\Session;
-use Ramsey\Uuid\Uuid;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Validator;
+use InvalidArgumentException;
 use Yajra\DataTables\Facades\DataTables;
 
 class InvoicesController extends Controller
@@ -34,7 +35,10 @@ class InvoicesController extends Controller
     public function __construct(
         private BillingIntegrationRegistry $billing,
         private InvoiceService $invoiceService,
-    ) {}
+        private InvoiceLineService $invoiceLineService,
+    ) {
+        $this->middleware('permission:invoice-see', ['only' => ['index', 'show']]);
+    }
 
     /**
      * Display a listing of the resource.
@@ -53,12 +57,6 @@ class InvoicesController extends Controller
      */
     public function show(Invoice $invoice)
     {
-        if ( ! auth()->user()->can('invoice-see')) {
-            session()->flash('flash_message_warning', __('You do not have permission to view this invoice'));
-
-            return redirect()->route('clients.index');
-        }
-
         $api = $this->billing->driver();
 
         $apiConnected    = ! ($api instanceof NullBillingAdapter);
@@ -92,7 +90,7 @@ class InvoicesController extends Controller
             ->withPaymentSources(PaymentSource::values())
             ->withAmountDue($amountDue)
             ->withSource($invoice->source)
-            ->withCompanyName(Setting::first()->company);
+            ->withCompanyName(Setting::cached()?->company ?? '');
     }
 
     /**
@@ -144,46 +142,58 @@ class InvoicesController extends Controller
 
             return redirect()->route('invoices.show', $external_id);
         }
-        $invoice = $this->findByExternalId($external_id);
 
-        if ( ! $invoice->canUpdateInvoice()) {
-            Session::flash('flash_message_warning', __("Can't insert new invoice line, to already sent invoice"));
+        $error = $this->createInvoiceLine($external_id, $request->all());
+
+        if ($error !== null) {
+            session()->flash('flash_message_warning', $error);
 
             return redirect()->back();
         }
-
-        $product = null;
-        if ($request->product_id) {
-            $product = $request->product_id;
-        } elseif ($request->product) {
-            $product = Product::whereExternalId($request->product)->first()->id;
-        }
-
-        InvoiceLine::query()->create([
-            'external_id' => Uuid::uuid4()->toString(),
-            'title'       => $request->title,
-            'comment'     => $request->comment,
-            'quantity'    => $request->quantity,
-            'type'        => $request->type,
-            'price'       => $request->price * 100,
-            'invoice_id'  => $invoice->id,
-            'product_id'  => $product,
-        ]);
 
         return redirect()->back();
     }
 
     public function newItems($external_id, Request $request)
     {
-        foreach ($request->all() as $invoiceLine) {
-            $invoiceLine = new AddInvoiceLine($invoiceLine);
-            $this->newItem($external_id, $invoiceLine);
+        if ( ! auth()->user()->can('modify-invoice-lines')) {
+            return response()->json(['message' => __('You do not have permission to modify invoice lines')], 403);
         }
+
+        $invoiceLines = $request->all();
+
+        foreach ($invoiceLines as $invoiceLine) {
+            if ( ! is_array($invoiceLine)) {
+                return response()->json(['message' => __('Invalid invoice line data')], 422);
+            }
+        }
+
+        $error = null;
+
+        try {
+            DB::transaction(function () use ($external_id, $invoiceLines, &$error) {
+                foreach ($invoiceLines as $invoiceLine) {
+                    $error = $this->createInvoiceLine($external_id, $invoiceLine);
+
+                    // A plain InvalidArgumentException here is just a rollback signal for
+                    // a per-line validation failure - not to be confused with the
+                    // ModelNotFoundException (itself a RuntimeException) that firstOrFail()
+                    // throws for an unknown invoice, which must propagate as a 404 instead.
+                    if ($error !== null) {
+                        throw new InvalidArgumentException($error);
+                    }
+                }
+            });
+        } catch (InvalidArgumentException $exception) {
+            return response()->json(['message' => $error ?? $exception->getMessage()], 422);
+        }
+
+        return response()->json(['message' => 'Invoice lines updated'], 200);
     }
 
     public function findByExternalId($external_id)
     {
-        return Invoice::whereExternalId($external_id)->first();
+        return Invoice::whereExternalId($external_id)->firstOrFail();
     }
 
     public function paymentsDataTable(Invoice $invoice)
@@ -219,7 +229,7 @@ class InvoicesController extends Controller
     public function moneyFormat()
     {
         $formats                  = [];
-        $currency                 = app(Currency::class, ['code' => Setting::query()->select('currency')->first()->currency]);
+        $currency                 = app(Currency::class, ['code' => Setting::query()->select('currency')->first()?->currency ?? 'USD']);
         $formats                  = array_merge($formats, $currency->toArray());
         $formats['vatPercentage'] = app(Tax::class)->multipleVatRate();
         $formats['vatRate']       = app(Tax::class)->vatRate();
@@ -232,5 +242,49 @@ class InvoicesController extends Controller
         $invoices = Invoice::pastDueAt()->get();
 
         return view('invoices.overdue')->withInvoices($invoices);
+    }
+
+    /**
+     * Validate and create a single invoice line from raw payload data.
+     *
+     * Shared by newItem() (real HTTP request, already re-validated by the
+     * AddInvoiceLine type-hint) and newItems() (a batch of plain arrays that
+     * never go through FormRequest's own validation pipeline, since it only
+     * runs on container-resolved requests, not manually constructed ones).
+     *
+     * @return string|null the error message on failure, or null on success
+     */
+    private function createInvoiceLine(string $external_id, array $data): ?string
+    {
+        $validator = Validator::make($data, (new AddInvoiceLine())->rules());
+
+        if ($validator->fails()) {
+            return $validator->errors()->first();
+        }
+
+        $invoice = $this->findByExternalId($external_id);
+
+        $product = null;
+        if ( ! empty($data['product_id'])) {
+            $product = $data['product_id'];
+        } elseif ( ! empty($data['product'])) {
+            $product = Product::whereExternalId($data['product'])->first()?->id;
+        }
+
+        try {
+            $this->invoiceLineService->createLine(
+                $invoice,
+                $data['title'],
+                $data['type'],
+                $data['quantity'],
+                (float) $data['price'],
+                $data['comment'] ?? null,
+                $product
+            );
+        } catch (InvalidArgumentException $exception) {
+            return __("Can't insert new invoice line, to already sent invoice");
+        }
+
+        return null;
     }
 }

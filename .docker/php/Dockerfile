@@ -1,59 +1,75 @@
-FROM php:7.3-fpm
-MAINTAINER Casper Bottelet <cbottelet@gmail.com>
+FROM php:8.3-fpm-bookworm
 
-# Update packages and install composer and PHP dependencies.
-RUN apt-get update && \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    mariadb-client \
-    libmemcached-dev \
-    libpq-dev \
-    libzip-dev \
-    libfreetype6-dev \
-    libjpeg62-turbo-dev \
-    libmcrypt-dev \
-    libbz2-dev \
+LABEL maintainer="DaybydayCRM Development Team"
+
+# Install system dependencies and PHP extensions in one layer for better caching
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
     cron \
-    nginx \
-    && pecl channel-update pecl.php.net \
-    && pecl install apcu
+    curl \
+    git \
+    libbz2-dev \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libexpat1 \
+    libfreetype6-dev \
+    libgbm1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libjpeg62-turbo-dev \
+    libmemcached-dev \
+    libpango-1.0-0 \
+    libpng-dev \
+    libpq-dev \
+    libxcb1 \
+    libxrender1 \
+    libxss1 \
+    mariadb-client \
+    zlib1g-dev \
+    && docker-php-ext-install \
+    bcmath \
+    zip \
+    bz2 \
+    mbstring \
+    pdo \
+    pdo_mysql \
+    pcntl \
+    opcache \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install gd \
+    && pecl install apcu memcached redis \
+    && docker-php-ext-enable apcu memcached redis \
+    && rm -rf /var/lib/apt/lists/*
 
-# PHP Extensions
-RUN docker-php-ext-install bcmath
-RUN docker-php-ext-install zip 
-RUN docker-php-ext-install bz2 
-RUN docker-php-ext-install mbstring 
-RUN docker-php-ext-install pdo 
-RUN docker-php-ext-install pdo_mysql 
-RUN docker-php-ext-install pcntl
-RUN docker-php-ext-configure gd --with-freetype-dir=/usr/include/ --with-jpeg-dir=/usr/include/ \
-&& docker-php-ext-install gd
-
-# Install the PHP mcrypt extention (from PECL, mcrypt has been removed from PHP 7.2)
-RUN pecl install mcrypt-1.0.2
-RUN docker-php-ext-enable mcrypt
-
-# Install the php memcached extension
-RUN pecl install memcached && docker-php-ext-enable memcached
-
-# Composer
+# Install Composer
 RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-#Nodejs
-RUN curl -sL https://deb.nodesource.com/setup_10.x | bash -
-RUN apt install nodejs -y
+# Install Node.js 20 and Yarn (for Laravel asset compilation)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g yarn \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd -g 1000 daybyday
-RUN useradd -u 1000 -ms /bin/bash daybyday -g daybyday
+# Create application user (non-root for security)
+RUN groupadd -g 1000 daybyday \
+    && useradd -u 1000 -ms /bin/bash daybyday -g daybyday
 
-ADD . /var/www/html
-COPY --chown=daybyday:daybyday . /var/www/html
+# Set working directory
 WORKDIR /var/www/html
 
-# Set permissions
-RUN chmod 0775 ./bootstrap/cache -R
-RUN chmod 0775 ./storage/* -R
+# Copy application files with correct ownership
+COPY --chown=daybyday:daybyday . .
 
-USER 1000:1000
+# Set proper permissions (directories 755, files 644)
+RUN chmod -R 0755 . \
+    && chmod -R 0775 bootstrap/cache storage
+
+# Run as non-root user
+USER daybyday:daybyday
 
 EXPOSE 9000
+
 CMD ["php-fpm"]
